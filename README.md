@@ -17,58 +17,58 @@ Sau đó hệ thống kết hợp các tín hiệu này để đưa ra một tro
 ## Sơ đồ tổng quan
 
 ```mermaid
-flowchart LR
-    subgraph IN["Đầu vào"]
-        V["Video webcam"]
-        A["Âm thanh micro"]
+flowchart TD
+    video["Video webcam"]
+    mic["Âm thanh micro"]
+
+    subgraph faceBranch["Nhánh khuôn mặt"]
+        faceTrack["Phát hiện và theo dõi khuôn mặt"]
+        identity["Xác minh danh tính"]
+        headPose["Hướng đầu"]
+        gaze["Hướng nhìn của mắt"]
     end
 
-    subgraph FACE["Nhánh khuôn mặt"]
-        F1["Phát hiện và theo dõi khuôn mặt"]
-        F2["Xác minh danh tính"]
-        F3["Hướng đầu"]
-        F4["Hướng nhìn của mắt"]
+    subgraph bodyBranch["Nhánh cơ thể và đồ vật"]
+        objects["Phát hiện điện thoại, sách, tai nghe"]
+        actions["Nhận biết hành động"]
     end
 
-    subgraph BODY["Nhánh cơ thể và đồ vật"]
-        B1["Phát hiện đồ vật<br/>(điện thoại, sách, tai nghe...)"]
-        B2["Nhận biết hành động"]
+    subgraph audioBranch["Nhánh âm thanh"]
+        speech["Phát hiện tiếng nói"]
+        overlap["Phát hiện nhiều người nói cùng lúc"]
+        speaker["Giọng thí sinh hay người khác"]
     end
 
-    subgraph AUDIO["Nhánh âm thanh"]
-        S1["Phát hiện tiếng nói"]
-        S2["Phát hiện nhiều người nói cùng lúc"]
-        S3["Nhận biết giọng thí sinh<br/>hay giọng người khác"]
-    end
+    fusion["Kết hợp các tín hiệu"]
+    decision{"Ra quyết định"}
+    normal["Bình thường"]
+    suspicious["Nghi vấn"]
+    unsure["Chưa chắc chắn, giám thị xem lại"]
+    swapAlert["Cảnh báo thay người"]
 
-    FUSE["Kết hợp các tín hiệu"]
-    DEC{"Ra quyết định"}
-    OK["Bình thường"]
-    SUS["Nghi vấn"]
-    UNK["Chưa chắc chắn<br/>→ giám thị xem lại"]
-    ID["Cảnh báo thay người"]
+    video --> faceTrack
+    video --> objects
+    video --> actions
+    mic --> speech
 
-    V --> F1
-    F1 --> F2
-    F1 --> F3
-    F1 --> F4
-    V --> B1
-    V --> B2
-    A --> S1 --> S2
-    S1 --> S3
+    faceTrack --> identity
+    faceTrack --> headPose
+    faceTrack --> gaze
+    speech --> overlap
+    speech --> speaker
 
-    F3 --> FUSE
-    F4 --> FUSE
-    B1 --> FUSE
-    B2 --> FUSE
-    S2 --> FUSE
-    S3 --> FUSE
+    headPose --> fusion
+    gaze --> fusion
+    objects --> fusion
+    actions --> fusion
+    overlap --> fusion
+    speaker --> fusion
 
-    FUSE --> DEC
-    DEC --> OK
-    DEC --> SUS
-    DEC --> UNK
-    F2 --> ID
+    fusion --> decision
+    decision --> normal
+    decision --> suspicious
+    decision --> unsure
+    identity --> swapAlert
 ```
 
 ## Nguyên tắc của dự án
