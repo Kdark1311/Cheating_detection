@@ -19,13 +19,22 @@ from pyannote.audio.pipelines.speaker_verification import PretrainedSpeakerEmbed
 from pyannote.audio.utils.signal import Binarize
 from pyannote.core import Segment, SlidingWindowFeature
 
+from evaluate import read, score
+from visualize import write_report
+
 SR = 16000
 SEG_STEP_S = 1.0
 EMBED_HOP_S = 5.0  # chunks overlap, so embedding every chunk mostly repeats work on CPU
 TARGET, OTHER, UNKNOWN = 0, 1, 2
 
+SEGMENTATION_MODEL = "pyannote/segmentation-3.0"
+SEGMENTATION_REV = "e66f3d3b9eb0873085418a7b813d3b369bf160bb"
+EMBEDDING_MODEL = "pyannote/wespeaker-voxceleb-resnet34-LM"
+EMBEDDING_REV = "837717ddb9ff5507820346191109dc79c958d614"
+
 # Starting values, to be calibrated on real recordings (step 5).
 MIN_CLEAN_S = 1.0  # embeddings on less clean speech are unreliable
+MAX_TURN_GAP_S = 1.0
 MIN_OTHER_S = 0.3
 MAX_UNKNOWN_S = 0.5
 MERGE_GAP_S = 5.0
@@ -56,6 +65,12 @@ def cosine(a, b):
     return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 
+def split_turns(active, gap_frames):
+    """One local speaker can hold unrelated turns: the model may reuse an ID across a pause."""
+    frames = np.flatnonzero(active)
+    return np.split(frames, np.flatnonzero(np.diff(frames) > gap_frames) + 1)
+
+
 def label_speakers(seg, waveform, embed, enroll, t_high, t_low):
     """Compare local speakers with the enrollment, skipping inactive ones.
 
@@ -77,20 +92,23 @@ def label_speakers(seg, waveform, embed, enroll, t_high, t_low):
             active = seg.data[c, :, s] > 0
             if not active.any():
                 continue
-            clean = active & ~overlap[c]
-            clean_s = clean.mean() * window.duration
-            score = math.nan
-            label = UNKNOWN
-            if clean_s >= MIN_CLEAN_S:
-                begin = round(start * SR)
-                wave = waveform[:, begin:begin + n_samples]
-                wave = torch.nn.functional.pad(wave, (0, n_samples - wave.shape[1]))
-                mask = torch.from_numpy(clean.astype(np.float32))[None]
-                score = cosine(embed(wave[None], masks=mask), enroll)
-                label = TARGET if score >= t_high else OTHER if score < t_low else UNKNOWN
-            votes[c, active, label] = 1.0
-            rows.append({"chunk_start": round(start, 2), "local_speaker": s,
-                         "clean_s": round(float(clean_s), 2), "cosine": round(score, 3)})
+            for turn in split_turns(active, MAX_TURN_GAP_S * n_frames / window.duration):
+                mask = np.zeros(n_frames, dtype=bool)
+                mask[turn] = True
+                clean = mask & ~overlap[c]
+                clean_s = clean.mean() * window.duration
+                score = math.nan
+                label = UNKNOWN
+                if clean_s >= MIN_CLEAN_S:
+                    begin = round(start * SR)
+                    wave = waveform[:, begin:begin + n_samples]
+                    wave = torch.nn.functional.pad(wave, (0, n_samples - wave.shape[1]))
+                    weights = torch.from_numpy(clean.astype(np.float32))[None]
+                    score = cosine(embed(wave[None], masks=weights), enroll)
+                    label = TARGET if score >= t_high else OTHER if score < t_low else UNKNOWN
+                votes[c, turn, label] = 1.0
+                rows.append({"chunk_start": round(start, 2), "local_speaker": s,
+                             "clean_s": round(float(clean_s), 2), "cosine": round(score, 3)})
     return votes, rows
 
 
@@ -107,12 +125,12 @@ def merge_regions(regions, gap):
 
 def decide(target_s, other_s, unknown_s, overlap_s, rms_db, quiet_db):
     """Skip only when sure it is the candidate alone; anything doubtful gets a human."""
+    if rms_db < quiet_db:  # near the noise floor the cosine is meaningless, so check this first
+        return "review", "quiet"
     if other_s >= MIN_OTHER_S:
         return "flag", "alternating" if target_s >= MIN_OTHER_S else "other_speaker"
     if overlap_s > 0:
         return "review", "overlap"
-    if rms_db < quiet_db:
-        return "review", "quiet"
     if unknown_s > MAX_UNKNOWN_S or target_s == 0:
         return "review", "unclear_speaker"
     return "ignore", "candidate_only"
@@ -123,7 +141,8 @@ def rms_db(wave):
 
 
 def build_events(speech, overlap, votes, seg, frames, waveform, quiet_db):
-    aggregated = Inference.aggregate(SlidingWindowFeature(votes, seg.sliding_window),
+    # aggregate() fills NaN in place, and NaN is what marks skipped chunks in `votes`.
+    aggregated = Inference.aggregate(SlidingWindowFeature(votes.copy(), seg.sliding_window),
                                      frames, missing=0.0)
     events = []
     for group in merge_regions([(r.start, r.end) for r in speech], MERGE_GAP_S):
@@ -143,6 +162,10 @@ def build_events(speech, overlap, votes, seg, frames, waveform, quiet_db):
     return events
 
 
+def regions_of(tl, track):
+    return [{"start": round(r.start, 2), "end": round(r.end, 2), "track": track} for r in tl]
+
+
 def write_csv(path, rows, fields):
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -155,6 +178,8 @@ def main():
     parser.add_argument("--enroll", required=True, type=Path)
     parser.add_argument("--session", required=True, type=Path)
     parser.add_argument("--out", type=Path)
+    parser.add_argument("--labels", type=Path, help="hand labels, shown in the report and scored")
+    parser.add_argument("--note", help="caption shown at the top of the report")
     parser.add_argument("--t-high", type=float, default=0.65, help="cosine >= this: candidate")
     parser.add_argument("--t-low", type=float, default=0.5, help="cosine < this: someone else")
     parser.add_argument("--quiet-db", type=float, default=-45.0)
@@ -165,9 +190,9 @@ def main():
     began = time.perf_counter()
     torch.set_num_threads(4)  # physical cores
     audio = Audio(sample_rate=SR, mono="downmix")
-    embed = PretrainedSpeakerEmbedding("pyannote/wespeaker-voxceleb-resnet34-LM",
+    embed = PretrainedSpeakerEmbedding(Model.from_pretrained(EMBEDDING_MODEL, revision=EMBEDDING_REV),
                                        device=torch.device("cpu"))
-    model = Model.from_pretrained("pyannote/segmentation-3.0", token=True)
+    model = Model.from_pretrained(SEGMENTATION_MODEL, revision=SEGMENTATION_REV, token=True)
 
     with tempfile.TemporaryDirectory() as tmp:
         enroll_wav, session_wav = Path(tmp, "enroll.wav"), Path(tmp, "session.wav")
@@ -192,11 +217,21 @@ def main():
                             "-to", str(event["end"]), "-i", str(session_wav),
                             str(out / event["clip"])], check=True)
 
-    write_csv(out / "events.csv", events, ["start", "end", "decision", "reason", "clip"])
-    write_csv(out / "scores.csv", rows, ["chunk_start", "local_speaker", "clean_s", "cosine"])
+        regions = regions_of(speech, "speech") + regions_of(overlap, "overlap")
+        for index, track in enumerate(["candidate", "other", "unknown"]):
+            votes_of = SlidingWindowFeature(votes[:, :, [index]], seg.sliding_window)
+            regions += regions_of(timeline(votes_of, frames), track)
 
-    elapsed = time.perf_counter() - began
-    peak_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 ** 2
+        write_csv(out / "events.csv", events, ["start", "end", "decision", "reason", "clip"])
+        write_csv(out / "scores.csv", rows, ["chunk_start", "local_speaker", "clean_s", "cosine"])
+
+        labels = read(args.labels) if args.labels else None
+        elapsed = time.perf_counter() - began
+        peak_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 ** 2
+        scores = [{**r, "cosine": None if math.isnan(r["cosine"]) else r["cosine"]} for r in rows]
+        write_report(out, session_wav, args.session.stem, regions, events, scores, args.t_high, args.t_low,
+                     {"elapsed": elapsed, "peak_gb": peak_gb}, labels, score(events, labels) if labels else None, args.note)
+
     print(f"{seconds:.0f}s audio in {elapsed:.0f}s ({elapsed / seconds:.2f}x), "
           f"peak RAM {peak_gb:.2f} GB, {len(events)} events -> {out}")
 
