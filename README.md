@@ -1,88 +1,82 @@
 # Cheating Detection – Hệ thống hỗ trợ giám sát thi trực tuyến
 
-Dự án nghiên cứu xây dựng hệ thống **phát hiện hành vi gian lận trong thi trực tuyến** từ video webcam và âm thanh micro của thí sinh.
+Dự án nghiên cứu **phát hiện gian lận trong thi trực tuyến** từ 3 camera và micro của thí sinh, xử lý offline sau buổi thi.
 
-Hệ thống **không thay thế giám thị**. Nó đánh dấu những đoạn đáng nghi, đồng thời nói rõ những ca nó không chắc chắn để giám thị xem lại. Nhờ vậy giám thị không phải xem toàn bộ video mà chỉ tập trung vào các đoạn cần thiết.
+Hệ thống **không thay thế giám thị**. Nó đánh dấu đoạn đáng nghi kèm bằng chứng (clip, đoạn âm thanh) để giám thị chỉ xem những đoạn cần thiết.
 
-## Hệ thống làm gì?
+Phạm vi: bài thi kiểu IELTS Listening/Reading/Writing trong Safe Exam Browser, không giấy nháp, phòng đóng cửa.
 
-Hệ thống quan sát thí sinh qua ba nhóm tín hiệu:
+## Hệ thống
 
-- **Khuôn mặt**: người đang thi có đúng là người đã đăng ký không, thí sinh có quay đầu hay nhìn ra ngoài màn hình lâu không.
-- **Cơ thể và đồ vật**: có điện thoại, sách, tai nghe hay người thứ hai trong khung hình không; thí sinh có các hành động bất thường như với tay hay rời chỗ không.
-- **Âm thanh**: có tiếng nói không, có nhiều người nói cùng lúc không, và giọng nói đó có phải của thí sinh không.
-
-Sau đó hệ thống kết hợp các tín hiệu này để đưa ra một trong ba kết luận cho mỗi tình huống: **nghi vấn**, **bình thường**, hoặc **chưa chắc chắn – cần giám thị xem lại**.
-
-## Sơ đồ tổng quan
+| Nhánh | Nguồn | Đánh dấu |
+|---|---|---|
+| Mặt | Webcam laptop (C1) | Đổi người, mất mặt, nhìn ra ngoài màn hình (head pose + gaze) |
+| Bàn | Điện thoại cạnh bàn (C2) | Tay rời bàn, điện thoại / giấy / tai nghe |
+| Phòng | Điện thoại quay phòng (C3) | Người thứ hai, hoạt động ở cửa |
+| Audio (phụ) | Micro | Giọng người khác (`other_voice`) |
 
 ```mermaid
-flowchart TD
-    video["Video webcam"]
-    mic["Âm thanh micro"]
+flowchart LR
+    checkin["Check-in: ảnh mặt, 20 s giọng, nhìn 4 góc màn hình"]
+    c1["C1 webcam laptop"]
+    c2["C2 điện thoại cạnh bàn"]
+    c3["C3 điện thoại quay phòng"]
+    mic["Micro"]
+    sync["Đồng bộ bằng tiếng bíp"]
+    face["Nhánh mặt"]
+    desk["Nhánh bàn"]
+    scene["Nhánh phòng"]
+    audio["Nhánh audio"]
+    fusion["Ghép sự kiện bằng luật"]
+    report["Báo cáo cho giám thị"]
 
-    subgraph faceBranch["Nhánh khuôn mặt"]
-        faceTrack["Phát hiện và theo dõi khuôn mặt"]
-        identity["Xác minh danh tính"]
-        headPose["Hướng đầu"]
-        gaze["Hướng nhìn của mắt"]
-    end
-
-    subgraph bodyBranch["Nhánh cơ thể và đồ vật"]
-        objects["Phát hiện điện thoại, sách, tai nghe"]
-        actions["Nhận biết hành động"]
-    end
-
-    subgraph audioBranch["Nhánh âm thanh"]
-        speech["Phát hiện tiếng nói"]
-        overlap["Phát hiện nhiều người nói cùng lúc"]
-        speaker["Giọng thí sinh hay người khác"]
-    end
-
-    fusion["Kết hợp các tín hiệu"]
-    decision{"Ra quyết định"}
-    normal["Bình thường"]
-    suspicious["Nghi vấn"]
-    unsure["Chưa chắc chắn, giám thị xem lại"]
-    swapAlert["Cảnh báo thay người"]
-
-    video --> faceTrack
-    video --> objects
-    video --> actions
-    mic --> speech
-
-    faceTrack --> identity
-    faceTrack --> headPose
-    faceTrack --> gaze
-    speech --> overlap
-    speech --> speaker
-
-    headPose --> fusion
-    gaze --> fusion
-    objects --> fusion
-    actions --> fusion
-    overlap --> fusion
-    speaker --> fusion
-
-    fusion --> decision
-    decision --> normal
-    decision --> suspicious
-    decision --> unsure
-    identity --> swapAlert
+    c1 --> sync
+    c2 --> sync
+    c3 --> sync
+    mic --> sync
+    sync --> face
+    sync --> desk
+    sync --> scene
+    sync --> audio
+    checkin --> face
+    checkin --> audio
+    face --> fusion
+    desk --> fusion
+    scene --> fusion
+    audio --> fusion
+    fusion --> report
 ```
 
-## Nguyên tắc của dự án
+Kết luận cho mỗi đoạn: **nghi gian lận** (≥ 2 nhánh cùng lúc, hoặc một dấu hiệu mạnh), **giám thị xem lại** (một dấu hiệu yếu), hoặc **bình thường**.
 
-- **Ưu tiên không bỏ sót**: mục tiêu là phát hiện được ít nhất 95% các tình huống gian lận.
-- **Minh bạch khi không chắc chắn**: khi hình ảnh mờ, mất mặt hoặc mất tiếng, hệ thống ghi rõ lý do và chuyển cho người xem lại, không tự đoán.
-- **Một tín hiệu đơn lẻ chưa phải là vi phạm**: ví dụ cúi xuống nhìn giấy nháp hợp lệ không bị coi là gian lận.
-- **Đánh giá nghiêm túc**: dữ liệu kiểm tra cuối cùng được tách riêng theo từng người và chỉ dùng một lần.
+## Nguyên tắc
 
-## Trạng thái hiện tại
+- **Một tín hiệu đơn lẻ chưa phải vi phạm**: ví dụ thí sinh nhẩm bài hay nhìn lên suy nghĩ không bị coi là gian lận.
+- **Minh bạch khi mất tín hiệu**: mất mặt, mất camera, mất tiếng được ghi rõ lý do, không tự coi là bình thường.
+- **Đánh giá nghiêm túc**: chia dữ liệu theo người, tập test khóa và chỉ dùng một lần; báo cả cảnh báo sai mỗi giờ.
 
-Dự án đang ở **giai đoạn lập kế hoạch thực nghiệm**: đã chọn mô hình cho từng thành phần, chưa tải dữ liệu và chưa có kết quả. Kế hoạch chi tiết từng bước nằm trong [experiment_plan.md](experiment_plan.md).
+## Tài liệu
 
-## Hạ tầng dự kiến
+- [docs/proposal.md](docs/proposal.md): thiết kế hệ thống, bộ dữ liệu, toàn bộ research question, lộ trình, nơi nộp paper.
+- [docs/research/](docs/research/): research question + nguồn đọc từng nhánh ([audio](docs/research/audio.md), [đặt camera](docs/research/camera-position.md)).
+- [docs/experiment_plan.md](docs/experiment_plan.md): các bước thực nghiệm theo từng research question.
 
-- 1–2 GPU RTX 3060 (12GB)
-- Python ≥ 3.12
+## Cấu trúc repo
+
+Mỗi thư mục có `README.md` riêng giải thích chi tiết.
+
+| Thư mục | Chứa gì |
+|---|---|
+| [docs/](docs/README.md) | Đề xuất, kế hoạch thực nghiệm, research question + nguồn đọc từng nhánh |
+| [data/](data/README.md) | Video, audio, nhãn, file chia tập (không commit) |
+| [src/cheating_detection/](src/cheating_detection/README.md) | Code: io, placement, face, desk, scene, audio, fusion, eval |
+| [experiments/](experiments/README.md) | Config + chỉ số của từng lần chạy |
+| [scripts/](scripts/README.md) | Lệnh chạy end-to-end |
+| [tests/](tests/README.md) | Test cho đồng bộ, chỉ số, luật ghép |
+| [paper/](paper/README.md) | Bản thảo paper |
+
+## Trạng thái
+
+**Giai đoạn research question + literature review.** Chưa có code phân tích, chưa quay dữ liệu.
+
+Cài môi trường: `uv sync` (Python ≥ 3.12). GPU: T4.
